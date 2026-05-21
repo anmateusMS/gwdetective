@@ -1,0 +1,10 @@
+# Local-only helper scripts and editor state
+_apply*.ps1
+*.code-workspace
+_tmp.js
+_serve.js
+
+# OS / IDE noise
+Thumbs.db
+.DS_Store
+.vscode/
