@@ -1,100 +1,102 @@
 # GW Detective
 
-> A single-file, browser-only analyser for **Power BI On-premises Data Gateway** log `.zip` bundles.
+A single file, browser based analyzer for Power BI On-premises Data Gateway log zip bundles.
 
-GW Detective is a self-contained `index.html` page that lets you drop in a gateway log archive and immediately get a structured, searchable view of every event, query, request and configuration item the gateway emitted. All processing happens **locally in your browser** — no data is ever uploaded.
+GW Detective turns a raw gateway log package into an interactive investigation console with filtering, correlation tracing, performance insights, and Power Platform traffic attribution.
 
-![Dark theme, Cool Slate palette](https://img.shields.io/badge/theme-dark-292929) ![Single file](https://img.shields.io/badge/deploy-single%20file-eab308) ![No backend](https://img.shields.io/badge/backend-none-15803d)
+## Live Site
 
----
+GitHub Pages: https://anmateusms.github.io/gwdetective/
+
+## Why this project exists
+
+Gateway log bundles can contain hundreds of files and thousands of lines. GW Detective helps you answer practical questions quickly:
+
+- What failed and when?
+- Which systems and endpoints were involved?
+- Which client types generated the most activity?
+- Where are bottlenecks and spikes in duration or resource use?
+- Which configuration or connectivity signals might explain the issue?
+
+All parsing happens locally in your browser tab.
+
+## Key capabilities
+
+- Dashboard summary with key counts and gateway metadata
+- Searchable Errors and Info views with severity filtering
+- Correlation tracing across log files using activity IDs
+- Network timeline analysis (HTTP/WebSocket/SignalR)
+- Mashup log parsing for data source and refresh behavior
+- Query analysis with duration, source, and attribution context
+- Power Platform attribution from QueryStartReport logs
+- Performance charts from gateway performance counter logs
+- Ports and installer history views
+- Config viewer with grouped/collapsible content
+
+## Supported log families
+
+- Gateway*.log
+- GatewayNetwork*.log
+- GatewayPipelineErrors*.log
+- Mashup[Pbi]*.log
+- QueryStartReport_*.log
+- PBIEGPerformanceCounterReading*.log
+- GatewayPortsTestResults*.log
+- GatewayInstaller*.log
+- GatewayConfigurator*.log
+
+Unknown files are preserved for search context when possible.
 
 ## Quick start
 
-1. Download or clone this repo.
-2. Open `index.html` in any modern browser (Chrome, Edge, Firefox).
-3. Drag a Power BI On-premises Data Gateway log `.zip` onto the drop zone, or click **Open Zip File**.
-4. Wait a few seconds while the bundle is parsed in-browser, then explore the tabs.
+1. Open [index.html](index.html) in a modern browser.
+2. Drag and drop a gateway log zip file, or click Open Zip File.
+3. Wait for parsing to complete.
+4. Use tabs, filters, and correlation tracing to investigate.
 
-No build step, no server, no install. The page works fully offline once loaded (CDN scripts can be inlined with the snippet at the top of `index.html`).
+No build step and no backend are required.
 
-## What it does
+## Privacy and security
 
-GW Detective ingests a raw gateway log bundle — typically hundreds of `.log` files — and turns it into a navigable analytics console:
+- Files are processed in the browser.
+- No upload pipeline or backend service is required.
+- No telemetry endpoint is used by the app itself.
 
-- **Dashboard** — gateway identity, version, machine info, totals (events, errors, warnings, queries, failures, average duration).
-- **Errors / Info** — every event with severity filtering, full-text search, correlation-ID tracing (click any row to follow a request across files).
-- **Network** — timeline of HTTP / WebSocket / SignalR traffic with status, latency and host.
-- **Mashup** — Power Query mashup events parsed from the mashup engine logs (data sources, evaluations, refresh activity).
-- **Queries** — every query the gateway ran, with duration, source product, query text and a per-query attribution column.
-- **Power Platform** — purpose-built tab that joins `QueryStartReport_*.log` CSV data against the gateway requests to attribute traffic to:
-  - **Client distribution** — PowerAutomate, LogicApps, PowerQueryOnline, PowerBI, PowerApps, "Other".
-  - **Connector types** — HTTP, SQL, Oracle, SharePoint, FILE, **PowerPlatformDataflows**, etc.
-  - **Top flows / logic apps / apps** by call volume, with the workflow ID, environment, top endpoint and unique-run count.
-  - **Top endpoints** by call volume with their connector type.
-- **Performance** — CPU / memory / network counter charts derived from `PBIEGPerformanceCounterReading*.log` files.
-- **Ports** — parsed results of the gateway's port connectivity tests, newest first, with stale/fresh badges.
-- **Installer** — installer and update history pulled from setup logs.
-- **Config** — full gateway configuration dump with collapsible groups.
+Note: if you use the default CDN script references, browser requests for library files go to those public CDNs. You can inline libraries for offline use.
 
-### Correlation tracing
+## Offline mode
 
-Clicking any row in Errors, Info or Queries promotes that event's correlation ID into a trace panel that shows every other log line — across every source file — sharing that ID, with timestamps and severities aligned. Each request also gets its `RootActivityId` / `CurrentActivityId` exposed so cross-file traces work even when the correlation ID rotates.
+A PowerShell snippet is included in [index.html](index.html) comments to inline JSZip and Chart.js assets. After inlining, the app can run as a fully self contained file.
 
-### Power Platform attribution colours
+## Project structure
 
-Throughout the UI, Power Platform clients and connectors are shown as colour-coded pills so you can scan a long table at a glance:
+- [index.html](index.html): Complete application UI, styles, parsing logic, and visualization code
+- [README.md](README.md): Project documentation
+- [gatewaytracer.code-workspace](gatewaytracer.code-workspace): Local VS Code workspace file
 
-| Pill | Colour | Used for |
-|---|---|---|
-| Purple | `#a855f7` | PowerAutomate |
-| Blue | `#3b82f6` | LogicApps |
-| Yellow | `#ca8a04` | PowerBI / Power BI Datasets |
-| Emerald | `#10b981` | PowerQueryOnline |
-| Pink | `#ec4899` | PowerApps |
-| Green | `#22c55e` | PowerPlatformDataflows |
+## Deploying updates to GitHub Pages
 
-## Privacy
+1. Commit and push changes to the main branch.
+2. GitHub Pages rebuilds automatically.
+3. Refresh the site URL after deployment completes.
 
-> **Your files never leave your browser.** The page has no backend, no telemetry and no outbound network calls. Parsing, indexing, charting and searching all happen inside the current tab.
+## Browser compatibility
 
-The only external requests the page makes are to public CDNs to fetch [JSZip](https://stuk.github.io/jszip/), [Chart.js](https://www.chartjs.org/) and the [Chart.js date-fns adapter](https://github.com/chartjs/chartjs-adapter-date-fns). To make the page **fully offline**, run the PowerShell snippet at the top of `index.html` once to inline all three libraries.
+Tested primarily in recent Chrome and Edge versions. Any modern browser with File API and ES2020 support should work.
 
-## Architecture
+## Known limitations
 
-`index.html` is the entire deliverable. Inside you'll find:
+- Large zip files may consume significant browser memory.
+- Extremely large datasets can make table rendering slower.
+- Parsing depends on expected gateway log shapes; uncommon formats may be partially parsed.
 
-| Section | What's in it |
-|---|---|
-| `<style>` | Cool Slate dark theme variables, all UI components (tabs, tables, cards, pills, charts) |
-| `<body>` | Static layout for the dropzone, header, tab bar and every tab's container |
-| `<script>` (last) | The full app: zip parsing, log parsers (gateway, mashup, performance counters, ports, installer, config, QueryStartReport CSV), attribution index, sortable table engine, chart builders, correlation tracer |
+## Roadmap ideas
 
-External dependencies (loaded from CDN, can be inlined):
-
-- [JSZip 3.10.1](https://stuk.github.io/jszip/)
-- [Chart.js 4.4.9](https://www.chartjs.org/)
-- [chartjs-adapter-date-fns 3.0.0](https://github.com/chartjs/chartjs-adapter-date-fns)
-
-## Supported log files
-
-GW Detective recognises and parses the standard Power BI On-premises Data Gateway log set, including:
-
-- `Gateway*.log` — main gateway service events
-- `GatewayNetwork*.log` — network / HTTP traffic
-- `GatewayPipelineErrors*.log` — pipeline error stream
-- `Mashup[Pbi]*.log` — Power Query mashup engine
-- `QueryStartReport_*.log` — Power Platform attribution CSV
-- `PBIEGPerformanceCounterReading*.log` — performance counters
-- `GatewayPortsTestResults*.log` — port test results
-- `GatewayInstaller*.log` — installer / update history
-- `GatewayConfigurator*.log` / config dumps — full gateway configuration
-
-Unknown files are still loaded and made available for full-text search.
-
-## Browser support
-
-Tested in current Chrome and Edge. Should work in any browser with reasonable ES2020 + `File` / `Blob` support.
+- Export filtered findings to CSV/JSON
+- Saved investigation snapshots
+- Additional parser coverage for edge-case formats
+- Optional timeline overlays for cross-tab event alignment
 
 ## License
 
-Internal Microsoft tooling. Not for redistribution outside the organisation.
+Internal Microsoft tooling.
