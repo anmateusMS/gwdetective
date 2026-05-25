@@ -184,6 +184,31 @@ body {
   color: var(--cp-accent);
 }
 
+.mode-picker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--cp-text-muted);
+}
+.mode-picker select,
+.mode-select {
+  padding: 3px 8px;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.625rem;
+  background: var(--cp-surface);
+  color: var(--cp-text);
+  font-size: 11px;
+  font-family: inherit;
+}
+.mode-picker select:focus,
+.mode-select:focus {
+  outline: none;
+  border-color: var(--cp-accent);
+}
+
 /* ── Buttons ── */
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1074,6 +1099,14 @@ body {
       Open Zip File
     </button>
     <input type="file" id="file-input" accept=".zip" style="display:none">
+    <div style="margin-top:32px; display:flex; align-items:center; gap:12px; justify-content:center;">
+      <span style="font-size:13px; color:var(--cp-text-muted);">Basic</span>
+      <div style="position:relative; width:42px; height:16px; background:#ffffff; border-radius:8px; cursor:pointer; transition:background 0.3s;" id="mode-switch" onclick="toggleMode()">
+        <div id="switch-thumb" style="position:absolute; top:2px; left:2px; width:12px; height:12px; background:var(--cp-bg); border-radius:6px; transition:left 0.3s; box-shadow:0 1px 3px rgba(0,0,0,0.3);"></div>
+      </div>
+      <span style="font-size:13px; color:var(--cp-text-muted);">Full</span>
+    </div>
+
 
     <div class="drop-footer">
       <div class="drop-privacy">
@@ -1086,20 +1119,16 @@ body {
         <span><strong>Privacy disclaimer:</strong> Your files never leave your browser.
         All processing is done locally — no data is uploaded to any server.</span>
       </div>
-      <div class="drop-counter">
-        <span>Visits: <span class="dc-val" id="dc-visits">0</span></span>
-        <span>Files analyzed: <span class="dc-val" id="dc-files">0</span></span>
-      </div>
       <div class="drop-actions">
         <!-- TODO: replace href with your repo URL -->
-        <a href="#" id="link-github" target="_blank" rel="noopener noreferrer" title="View source on GitHub">
+        <a href="https://github.com/anmateusMS/gwdetective" id="link-github" target="_blank" rel="noopener noreferrer" title="View source on GitHub">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
             <path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 005.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/>
           </svg>
           View on GitHub
         </a>
         <!-- TODO: replace mailto target with your feedback email -->
-        <a href="mailto:?subject=GW%20Detective%20feedback" id="link-feedback" title="Send feedback by email">
+        <a href="mailto:anmateus@microsoft.com?subject=GW%20Detective%20feedback" id="link-feedback" title="Send feedback by email">
           💬 Send Feedback
         </a>
       </div>
@@ -1454,7 +1483,8 @@ const state = {
   rawFiles:     {},   // filename → string (config / report / ports)
   chart:        null,
   activeTab:    'dashboard',
-  corrFilter:   null  // lowercase UUID string | null
+  corrFilter:   null, // lowercase UUID string | null
+  isBasicMode:  true  // true = basic, false = full
 };
 state.queryExecRows    = [];
 state.queryExecFiltered = [];
@@ -1468,8 +1498,45 @@ state.currentTraceId   = null;  // id of currently open trace panel
 state.sortState        = {};    // tableKey → { field, dir: 'asc'|'desc'|null }
 state.globalDateFilter = { from: null, to: null }; // applied to every tab
 state._orig            = null;  // pristine copies of source arrays for re-filtering
+state.ingestStats      = null;  // dropped rows when low-memory caps are hit
 
 const LOG_TABS = ['errors','info','network','mashup','queries','installer'];
+
+// Aggressive caps to keep browser memory bounded on very large uploads.
+const MAX_LOG_ENTRIES_TOTAL = 180000;
+const MAX_QUERY_EXEC_ROWS = 120000;
+const MAX_QUERY_START_ROWS = 120000;
+const MAX_PERF_ROWS_PER_TYPE = 120000;
+const MODE_KEY = 'gwTracerMode';
+const HARD_MAX_ZIP_BYTES = 700 * 1024 * 1024;
+
+function isBasicMode() {
+  return state.isBasicMode === true;
+}
+
+function setMode(isBasic) {
+  state.isBasicMode = isBasic;
+  try { localStorage.setItem(MODE_KEY, isBasic ? 'basic' : 'full'); } catch {}
+  const switchEl = document.getElementById('mode-switch');
+  const thumb = document.getElementById('switch-thumb');
+  if (switchEl && thumb) {
+    if (isBasic) {
+      thumb.style.left = '2px';
+    } else {
+      thumb.style.left = '28px';
+    }
+  }
+}
+
+function toggleMode() {
+  setMode(!state.isBasicMode);
+}
+
+function initMode() {
+  let saved = 'basic';
+  try { saved = localStorage.getItem(MODE_KEY) || 'basic'; } catch {}
+  setMode(saved === 'basic');
+}
 
 // ── File → tab mapping ───────────────────────────────────────────────────────
 function getEntryTab(name) {
@@ -1506,6 +1573,14 @@ function isRawFile(name) {
          n.includes('querystreaming');
 }
 
+function isEssentialRawFile(name) {
+  const n = name.toLowerCase();
+  return n.includes('gatewayports')
+      || n.includes('gatewaycluster')
+      || n.includes('gatewayproperties')
+      || n.includes('gatewayallclusters');
+}
+
 // ── CSV parser ───────────────────────────────────────────────────────────────
 function parseCsvRow(line) {
   const res = []; let inQ = false, cur = '';
@@ -1520,27 +1595,70 @@ function parseCsvRow(line) {
 }
 
 function parseQueryExecCsv(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  if (lines.length < 2) return [];
-  const headers = parseCsvRow(lines[0]);
-  return lines.slice(1).map(line => {
+  const rows = [];
+  const lineRe = /[^\r\n]+/g;
+  let m = lineRe.exec(text);
+  if (!m) return rows;
+
+  const headers = parseCsvRow(m[0]).map(h => h.trim());
+  const idx = {};
+  for (let i = 0; i < headers.length; i++) idx[headers[i]] = i;
+
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
+    if (!line.trim()) continue;
     const vals = parseCsvRow(line);
-    const row = {};
-    headers.forEach((h, i) => { row[h.trim()] = (vals[i] || '').trim(); });
-    row._ts   = row['QueryExecutionEndTimeUTC'] ? new Date(row['QueryExecutionEndTimeUTC']) : null;
-    row._dur  = parseInt(row['QueryExecutionDuration(ms)']) || 0;
-    row._ok   = row['Success'] === 'Y';
-    row._src  = extractDataSourceUrl(row['DataSource'] || '');
-    row._err  = row['ErrorMessage'] || '';
-    row._type = row['QueryType'] || '';
-    return row;
-  });
+
+    const endTime = (vals[idx['QueryExecutionEndTimeUTC']] || '').trim();
+    const dur = parseInt(vals[idx['QueryExecutionDuration(ms)']] || '0', 10) || 0;
+    const ok = ((vals[idx['Success']] || '').trim().toUpperCase() === 'Y');
+    const ds = (vals[idx['DataSource']] || '').trim();
+    const err = (vals[idx['ErrorMessage']] || '').trim();
+    const type = (vals[idx['QueryType']] || '').trim();
+    const trackingId = (vals[idx['QueryTrackingId']] || '').trim();
+    const requestId = (vals[idx['RequestId']] || '').trim();
+    const dataRead = parseInt(vals[idx['DataReadingDuration(ms)']] || '0', 10) || 0;
+    const serialize = parseInt(vals[idx['DataSerializationDuration(ms)']] || '0', 10) || 0;
+
+    rows.push({
+      _ts: endTime ? new Date(endTime) : null,
+      _endTime: endTime,
+      _dur: dur,
+      _ok: ok,
+      _src: extractDataSourceUrl(ds),
+      _err: err,
+      _type: type,
+      _trackingId: trackingId,
+      _requestId: requestId,
+      _dataRead: dataRead,
+      _serialize: serialize,
+    });
+  }
+  return rows;
 }
 
 // Safe append for large arrays — `arr.push(...big)` overflows the call stack at ~100k items.
 function appendAll(target, src) {
   if (src.length < 10000) { target.push(...src); return; }
   for (let i = 0; i < src.length; i++) target.push(src[i]);
+}
+
+function appendWithCap(target, src, cap, dropKey) {
+  if (cap <= 0) {
+    appendAll(target, src);
+    return;
+  }
+  const room = cap - target.length;
+  if (room <= 0) {
+    if (state.ingestStats && dropKey) state.ingestStats[dropKey] += src.length;
+    return;
+  }
+  if (src.length <= room) {
+    appendAll(target, src);
+    return;
+  }
+  appendAll(target, src.slice(0, room));
+  if (state.ingestStats && dropKey) state.ingestStats[dropKey] += (src.length - room);
 }
 
 // Safe max/min on large arrays — Math.max(...arr) overflows the call stack at ~100k items.
@@ -1556,24 +1674,67 @@ function minOf(arr) {
 }
 
 function parsePerfReport(name, text) {
-  const lines = text.split(/\r?\n/);
-  if (lines.length < 2) return;
-  const headers = parseCsvRow(lines[0]).map(h => h.trim());
+  const n = name.toLowerCase();
+  const lineRe = /[^\r\n]+/g;
+  let m = lineRe.exec(text);
+  if (!m) return;
+  const headers = parseCsvRow(m[0]).map(h => h.trim());
+  const idx = {};
+  for (let i = 0; i < headers.length; i++) idx[headers[i]] = i;
   const out = [];
-  for (let li = 1; li < lines.length; li++) {
-    const line = lines[li];
+
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
     if (!line.trim()) continue;
     const vals = parseCsvRow(line);
-    const row = {};
-    for (let i = 0; i < headers.length; i++) row[headers[i]] = (vals[i] || '').trim();
-    out.push(row);
+
+    if (n.includes('systemcounter')) {
+      out.push({
+        CounterName: (vals[idx['CounterName']] || '').trim(),
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Average: (vals[idx['Average']] || '').trim(),
+        Max: (vals[idx['Max']] || '').trim(),
+        Min: (vals[idx['Min']] || '').trim(),
+      });
+    } else if (n.includes('concurrentoperation')) {
+      out.push({
+        CounterName: (vals[idx['CounterName']] || '').trim(),
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Max: (vals[idx['Max']] || '').trim(),
+      });
+    } else if (n.includes('queryexecutionaggregation')) {
+      out.push({
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Success: (vals[idx['Success']] || '').trim(),
+        Count: (vals[idx['Count']] || '').trim(),
+        'AverageQueryExecutionDuration(ms)': (vals[idx['AverageQueryExecutionDuration(ms)']] || '').trim(),
+        'MaxQueryExecutionDuration(ms)': (vals[idx['MaxQueryExecutionDuration(ms)']] || '').trim(),
+      });
+    } else if (n.includes('mashupevaluation')) {
+      out.push({
+        RequestId: (vals[idx['RequestId']] || '').trim(),
+        DataSource: (vals[idx['DataSource']] || '').trim(),
+        'TotalProcessorTime(ms)': (vals[idx['TotalProcessorTime(ms)']] || '').trim(),
+        MaxWorkingSet: (vals[idx['MaxWorkingSet']] || '').trim(),
+        MaxPercentProcessorTime: (vals[idx['MaxPercentProcessorTime']] || '').trim(),
+      });
+    } else if (n.includes('openconnection')) {
+      out.push({
+        OpenConnectionStartTimeUTC: (vals[idx['OpenConnectionStartTimeUTC']] || '').trim(),
+        RequestId: (vals[idx['RequestId']] || '').trim(),
+        DataSource: (vals[idx['DataSource']] || '').trim(),
+        'OpenConnectionDuration(ms)': (vals[idx['OpenConnectionDuration(ms)']] || '').trim(),
+        Success: (vals[idx['Success']] || '').trim(),
+        ErrorMessage: (vals[idx['ErrorMessage']] || '').trim(),
+      });
+    }
   }
-  const n = name.toLowerCase();
-  if (n.includes('systemcounter'))                  appendAll(state.perf.counters,   out);
-  else if (n.includes('concurrentoperation'))       appendAll(state.perf.concurrent,  out);
-  else if (n.includes('queryexecutionaggregation')) appendAll(state.perf.queryAgg,    out);
-  else if (n.includes('mashupevaluation'))          appendAll(state.perf.mashupEval,  out);
-  else if (n.includes('openconnection'))            appendAll(state.perf.openConn,    out);
+
+  if (n.includes('systemcounter'))                  appendWithCap(state.perf.counters,  out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf');
+  else if (n.includes('concurrentoperation'))       appendWithCap(state.perf.concurrent, out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf');
+  else if (n.includes('queryexecutionaggregation')) appendWithCap(state.perf.queryAgg,   out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf');
+  else if (n.includes('mashupevaluation'))          appendWithCap(state.perf.mashupEval, out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf');
+  else if (n.includes('openconnection'))            appendWithCap(state.perf.openConn,   out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf');
 }
 
 function extractDataSourceUrl(ds) {
@@ -1618,10 +1779,12 @@ function extractConnectorType(ds) {
 // We deliberately drop QueryText (often a multi-KB base64 SOAP payload).
 function parseQueryStartCsv(text) {
   const rows = [];
-  const lines = text.split(/\r?\n/);
-  if (lines.length < 2) return rows;
-  for (let li = 1; li < lines.length; li++) {
-    const line = lines[li];
+  const lineRe = /[^\r\n]+/g;
+  // Skip header line
+  if (!lineRe.exec(text)) return rows;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
     if (!line || line.length < 50) continue;
     const vals = parseCsvRow(line);
     if (vals.length < 8) continue;
@@ -1637,7 +1800,6 @@ function parseQueryStartCsv(text) {
       _client:        null,
       _service:       null,
       _envId:         null,
-      _crid:          null,
       _connId:        null,
       _workflowId:    null,
       _runId:         null,
@@ -1658,7 +1820,6 @@ function parseQueryStartCsv(text) {
               switch (t && t.key) {
                 case 'Client':            row._client            = v; break;
                 case 'EnvironmentId':     row._envId             = v; break;
-                case 'Crid':              row._crid              = v; break;
                 case 'ConnectionId':      row._connId            = v; break;
                 case 'WorkflowId':        row._workflowId        = v; break;
                 case 'RunId':             row._runId             = v; break;
@@ -1803,11 +1964,37 @@ const MSGCODE_RE = /\b([0-9A-F]{8})\b/;
 const MODULE_RE  = /\[([^\]]+)\]\s*([\s\S]*)$/;
 
 let _idSeq = 0;
+const DROP_VERBOSE_IN_LOW_MEMORY = true;
+const RAW_FILE_MAX_CHARS = 200000;
+const PORT_RAW_FILE_MAX_CHARS = 400000;
+const MAX_ENTRY_MESSAGE_CHARS = 4000;
+
+function cacheRawFile(name, text) {
+  const lower = name.toLowerCase();
+  // Port reports can be large; cap them separately in low-memory mode.
+  if (lower.includes('gatewayports')) {
+    if (text.length > PORT_RAW_FILE_MAX_CHARS) {
+      state.rawFiles[name] = text.substring(0, PORT_RAW_FILE_MAX_CHARS)
+        + '\n\n… (port report truncated in memory to reduce browser usage)';
+    } else {
+      state.rawFiles[name] = text;
+    }
+    return;
+  }
+  // Config/raw files are previewed in the UI; cap retained size to avoid OOM.
+  if (text.length > RAW_FILE_MAX_CHARS) {
+    state.rawFiles[name] = text.substring(0, RAW_FILE_MAX_CHARS)
+      + '\n\n… (truncated in memory to reduce browser usage)';
+    return;
+  }
+  state.rawFiles[name] = text;
+}
 
 function parseLine(line, filename, tab) {
   const m = line.match(LINE_RE);
   if (!m) return null;
   const [, source, level, tsStr, rest] = m;
+
   const timestamp = new Date(tsStr);
   if (isNaN(timestamp)) return null;
 
@@ -1816,33 +2003,42 @@ function parseLine(line, filename, tab) {
 
   const modMatch = rest.match(MODULE_RE);
   const module  = modMatch ? modMatch[1] : '';
-  const message = modMatch ? modMatch[2].trim() : rest.trim();
+  let message = modMatch ? modMatch[2].trim() : rest.trim();
+  if (message.length > MAX_ENTRY_MESSAGE_CHARS) {
+    message = message.substring(0, MAX_ENTRY_MESSAGE_CHARS) + '\n… (message truncated)';
+  }
 
   const codeMatch = rest.match(MSGCODE_RE);
   const messageCode = codeMatch ? codeMatch[1] : '';
 
-  return { id: _idSeq++, source, level, timestamp, correlationIds, module, messageCode, message, file: filename, tab, raw: line };
+  return { id: _idSeq++, source, level, timestamp, correlationIds, module, messageCode, message, file: filename, tab };
 }
 
-// Multi-line aware parser (handles stack traces)
-function parseLogFileMultiLine(text, filename, tab) {
-  const lines = text.split(/\r?\n/);
-  const entries = [];
+// Multi-line aware parser (handles stack traces). Emits entries one-by-one
+// through `onEntry` to avoid building temporary arrays for each file.
+function parseLogFileMultiLine(text, filename, tab, onEntry) {
   let current = null;
-  for (const line of lines) {
+  const lineRe = /[^\r\n]+/g;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
     if (!line.trim()) continue;
     const parsed = parseLine(line, filename, tab);
     if (parsed) {
-      if (current) entries.push(current);
+      if (current) onEntry(current);
       current = parsed;
     } else if (current) {
       // Stack trace / continuation line
-      current.message += '\n' + line;
-      current.raw     += '\n' + line;
+      if (current.message.length < MAX_ENTRY_MESSAGE_CHARS) {
+        const rem = MAX_ENTRY_MESSAGE_CHARS - current.message.length;
+        current.message += '\n' + line.substring(0, Math.max(0, rem));
+        if (current.message.length >= MAX_ENTRY_MESSAGE_CHARS) {
+          current.message += '\n… (message truncated)';
+        }
+      }
     }
   }
-  if (current) entries.push(current);
-  return entries;
+  if (current) onEntry(current);
 }
 
 // ── Generic sortable-table engine ────────────────────────────────────────────
@@ -1932,8 +2128,8 @@ function applySortedQueryCsv() {
     if (s.field === '_product' || s.field === '_connector') {
       items = sortByAttribution(items, s.field, s.dir, r => {
         const ids = [];
-        if (r['QueryTrackingId']) ids.push(r['QueryTrackingId'].toLowerCase());
-        if (r['RequestId'])       ids.push(r['RequestId'].toLowerCase());
+        if (r._trackingId) ids.push(r._trackingId.toLowerCase());
+        if (r._requestId)  ids.push(r._requestId.toLowerCase());
         return ids;
       });
     } else {
@@ -2018,7 +2214,7 @@ function makeRow(entry) {
   const conn = renderConnectorCell(attr);
 
   const ms = document.createElement('span'); ms.className = 'col-message';
-  ms.textContent = entry.message; ms.title = entry.raw;
+  ms.textContent = entry.message; ms.title = entry.message;
 
   div.appendChild(t); div.appendChild(l); div.appendChild(mo); div.appendChild(prod); div.appendChild(conn); div.appendChild(ms);
 
@@ -2086,13 +2282,25 @@ function bumpFileCount() {
   paintCounters();
 }
 bumpVisitOnce();
+initMode();
 
 // ── Load zip ─────────────────────────────────────────────────────────────────
 async function loadZip(file) {
   setLoading(true, 'Opening zip…');
   try {
-    const buf = await file.arrayBuffer();
+    if (file.size > HARD_MAX_ZIP_BYTES) {
+      alert(
+        `Zip is too large for in-browser parsing (${fmtN(Math.round(file.size / (1024 * 1024)))} MB).\n\n`
+        + `Limit: ${fmtN(Math.round(HARD_MAX_ZIP_BYTES / (1024 * 1024)))} MB.\n`
+        + 'Please split the archive or upload a smaller subset.'
+      );
+      setLoading(false);
+      return;
+    }
+    let buf = await file.arrayBuffer();
     const zip = await JSZip.loadAsync(buf);
+    // Drop the source ArrayBuffer reference once zip metadata is loaded.
+    buf = null;
     await processZip(zip);
     bumpFileCount();
   } catch (err) {
@@ -2103,6 +2311,7 @@ async function loadZip(file) {
 
 async function processZip(zip) {
   _idSeq = 0;
+  state.ingestStats = { droppedLogs: 0, droppedQueryExec: 0, droppedQueryStart: 0, droppedPerf: 0, skippedFiles: 0 };
   state.allEntries  = [];
   state.tabEntries  = Object.fromEntries(LOG_TABS.map(t => [t, []]));
   state.tabFiltered = Object.fromEntries(LOG_TABS.map(t => [t, []]));
@@ -2125,35 +2334,71 @@ async function processZip(zip) {
     if (!name) continue;
     setLoading(true, `Parsing ${name} (${++done}/${entries.length})…`);
 
+  
+
     let text;
     try { text = await ze.async('string'); } catch { continue; }
 
     if (isQueryExecCsv(name)) {
-      appendAll(state.queryExecRows, parseQueryExecCsv(text));
+      if (isBasicMode()) {
+        state.ingestStats.skippedFiles++;
+        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+        continue;
+      }
+      appendWithCap(state.queryExecRows, parseQueryExecCsv(text), MAX_QUERY_EXEC_ROWS, 'droppedQueryExec');
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
       continue;
     }
     if (isQueryStartCsv(name)) {
-      appendAll(state.queryStartRows, parseQueryStartCsv(text));
+      if (isBasicMode()) {
+        state.ingestStats.skippedFiles++;
+        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+        continue;
+      }
+      appendWithCap(state.queryStartRows, parseQueryStartCsv(text), MAX_QUERY_START_ROWS, 'droppedQueryStart');
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
       continue;
     }
     if (isPerfReport(name)) {
+      if (isBasicMode()) {
+        state.ingestStats.skippedFiles++;
+        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+        continue;
+      }
       parsePerfReport(name, text);
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
       continue;
     }
     if (isRawFile(name)) {
-      state.rawFiles[name] = text;
       parseGwInfoFromText(name, text);
+      cacheRawFile(name, text);
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
       continue;
     }
     const tab = getEntryTab(name);
-    if (!tab) { state.rawFiles[name] = text; continue; }
+    if (isBasicMode() && !['errors', 'info'].includes(tab)) {
+      state.ingestStats.skippedFiles++;
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+      continue;
+    }
+    if (!tab) {
+      cacheRawFile(name, text);
+      text = '';
+      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+      continue;
+    }
 
-    const parsed = parseLogFileMultiLine(text, name, tab);
-    for (const e of parsed) {
+    parseLogFileMultiLine(text, name, tab, (e) => {
+      if (!isBasicMode() && state.allEntries.length >= MAX_LOG_ENTRIES_TOTAL) {
+        state.ingestStats.droppedLogs++;
+        return;
+      }
       state.allEntries.push(e);
       state.tabEntries[tab].push(e);
       if (e.module) state.modules.add(e.module);
-    }
+    });
+    text = '';
+    if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
   }
 
   if (state.queryExecRows.length > 0)
@@ -2165,25 +2410,37 @@ async function processZip(zip) {
   // port-test runs are visible chronologically alongside real network events.
   injectPortTestsIntoNetwork();
 
-  // Snapshot pristine copies of every source array so the global date filter
-  // can re-derive a fresh filtered view on each change without losing data.
+  // Keep references to the full source arrays so global date filtering can
+  // re-derive a fresh view without duplicating large arrays in memory.
   state._orig = {
-    allEntries:     state.allEntries.slice(),
-    tabEntries:     Object.fromEntries(LOG_TABS.map(t => [t, state.tabEntries[t].slice()])),
-    queryExecRows:  state.queryExecRows.slice(),
-    queryStartRows: state.queryStartRows.slice(),
+    allEntries:     state.allEntries,
+    tabEntries:     Object.fromEntries(LOG_TABS.map(t => [t, state.tabEntries[t]])),
+    queryExecRows:  state.queryExecRows,
+    queryStartRows: state.queryStartRows,
     perf: {
-      counters:   state.perf.counters.slice(),
-      concurrent: state.perf.concurrent.slice(),
-      queryAgg:   state.perf.queryAgg.slice(),
-      mashupEval: state.perf.mashupEval.slice(),
-      openConn:   state.perf.openConn.slice(),
+      counters:   state.perf.counters,
+      concurrent: state.perf.concurrent,
+      queryAgg:   state.perf.queryAgg,
+      mashupEval: state.perf.mashupEval,
+      openConn:   state.perf.openConn,
     },
   };
   state.globalDateFilter = { from: null, to: null };
 
   setLoading(false);
   buildUI();
+  const st = state.ingestStats || {};
+  const dropped = (st.droppedLogs || 0) + (st.droppedQueryExec || 0) + (st.droppedQueryStart || 0) + (st.droppedPerf || 0);
+  if (isBasicMode() && (dropped > 0 || (st.skippedFiles || 0) > 0)) {
+    alert(
+      `Loaded in ${state.isBasicMode ? 'Basic' : 'Full'} mode. Some rows were skipped to prevent browser crashes:\n\n`
+      + `Log events: ${fmtN(st.droppedLogs || 0)}\n`
+      + `QueryExecution rows: ${fmtN(st.droppedQueryExec || 0)}\n`
+      + `QueryStart rows: ${fmtN(st.droppedQueryStart || 0)}\n`
+      + `Performance rows: ${fmtN(st.droppedPerf || 0)}\n`
+      + `Skipped heavy files: ${fmtN(st.skippedFiles || 0)}`
+    );
+  }
 }
 
 function injectPortTestsIntoNetwork() {
@@ -3640,8 +3897,8 @@ function formatConfigContent(name, text) {
     dur.innerHTML = `<span class="dur-bar ${barCls}" style="width:${barW}px"></span>${fmtN(row._dur)} ms`;
     const tp  = document.createElement('span'); tp.className  = 'q-type'; tp.textContent = row._type;
     const ids = [];
-    if (row['QueryTrackingId']) ids.push(row['QueryTrackingId'].toLowerCase());
-    if (row['RequestId'])       ids.push(row['RequestId'].toLowerCase());
+    if (row._trackingId) ids.push(row._trackingId.toLowerCase());
+    if (row._requestId)  ids.push(row._requestId.toLowerCase());
     const attr = lookupAttribution(ids);
     const prod = renderProductCell(attr);
     const conn = renderConnectorCell(attr);
@@ -3677,7 +3934,7 @@ function formatConfigContent(name, text) {
   function showQueryDetail(row) {
     const panel = document.getElementById('trace-panel');
     panel.style.display = 'flex';
-    document.getElementById('trace-corr-id').textContent = row['QueryTrackingId'] || '—';
+      document.getElementById('trace-corr-id').textContent = row._trackingId || '—';
     document.getElementById('trace-stats').textContent =
       `${row._type} · ${row._ok ? '✓ Success' : '✗ Failed'} · ${fmtN(row._dur)} ms`;
     document.getElementById('pin-btns').style.display = 'none';
@@ -3686,19 +3943,19 @@ function formatConfigContent(name, text) {
     // Activity IDs alongside the gateway-side ids. These come from the
     // QueryStartReport's EvaluationContext JSON, not the QueryExecutionReport.
     const _attrIds = [];
-    if (row['QueryTrackingId']) _attrIds.push(row['QueryTrackingId'].toLowerCase());
-    if (row['RequestId'])       _attrIds.push(row['RequestId'].toLowerCase());
+    if (row._trackingId) _attrIds.push(row._trackingId.toLowerCase());
+    if (row._requestId)  _attrIds.push(row._requestId.toLowerCase());
     const _attr = lookupAttribution(_attrIds);
     const kv = [
       ['Status',    row._ok ? '✓ Success' : '✗ Failed'],
-      ['End Time',  row['QueryExecutionEndTimeUTC'] || '—'],
+      ['End Time',  row._endTime || '—'],
       ['Duration',  fmtN(row._dur) + ' ms'],
       ['Type',      row._type],
       ['Data Source', row._src],
-      ['Data Read', fmtN(parseInt(row['DataReadingDuration(ms)'])||0) + ' ms'],
-      ['Serialize', fmtN(parseInt(row['DataSerializationDuration(ms)'])||0) + ' ms'],
-      ['RequestId', row['RequestId'] || '—'],
-      ['QueryTrackingId', row['QueryTrackingId'] || '—'],
+      ['Data Read', fmtN(row._dataRead || 0) + ' ms'],
+      ['Serialize', fmtN(row._serialize || 0) + ' ms'],
+      ['RequestId', row._requestId || '—'],
+      ['QueryTrackingId', row._trackingId || '—'],
     ];
     if (_attr && _attr.rootActivityId)    kv.push(['RootActivityId',    _attr.rootActivityId]);
     if (_attr && _attr.currentActivityId) kv.push(['CurrentActivityId', _attr.currentActivityId]);
@@ -3710,7 +3967,7 @@ function formatConfigContent(name, text) {
       </div>`).join('');
 
     // Add jump-to-logs action if we have an id that exists in any log entry
-    const reqId = (row['RequestId'] || row['QueryTrackingId'] || '').trim();
+    const reqId = (row._requestId || row._trackingId || '').trim();
     if (reqId) {
       const reqIdLower = reqId.toLowerCase();
       const hasLogMatch = state.allEntries.some(e => e.correlationIds.includes(reqIdLower));
@@ -3994,7 +4251,7 @@ function showRawDetail(entry) {
   document.getElementById('pin-btns').style.display = 'none';
   state.currentTraceId = null;
   document.getElementById('trace-body').innerHTML =
-    `<pre style="font-family:Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;padding:4px;color:var(--cp-text)">${esc(entry.raw)}</pre>`;
+    `<pre style="font-family:Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;padding:4px;color:var(--cp-text)">${esc(entry.raw || entry.message || '')}</pre>`;
 }
 
 function clearCorrelation() {
@@ -4217,6 +4474,7 @@ function resetApp() {
   state.queryExecFiltered = [];
   state.queryCsvScroller = null;
   state.queryMaxDur      = 0;
+  state.ingestStats      = null;
   state.compareA         = null;
   state.compareB         = null;
   state.currentTraceId   = null;
