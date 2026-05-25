@@ -1470,6 +1470,479 @@ body {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js" crossorigin="anonymous"></script>
+
+<!-- ─── Parser Web Worker bundle ─────────────────────────────────────────────
+     This script tag is NOT executed directly (non-standard type). Its text
+     content is read at runtime, wrapped in a Blob, and instantiated as a
+     Worker so all zip decompression + log parsing runs off the main thread.
+-->
+<script id="worker-bundle" type="text/x-worker-source">
+'use strict';
+importScripts('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+
+// ── Constants (kept in sync with main script) ───────────────────────────────
+const MAX_LOG_ENTRIES_TOTAL   = 180000;
+const MAX_QUERY_EXEC_ROWS     = 120000;
+const MAX_QUERY_START_ROWS    = 120000;
+const MAX_PERF_ROWS_PER_TYPE  = 120000;
+const RAW_FILE_MAX_CHARS      = 200000;
+const PORT_RAW_FILE_MAX_CHARS = 400000;
+const MAX_ENTRY_MESSAGE_CHARS = 4000;
+const LOG_TABS = ['errors','info','network','mashup','queries','installer'];
+
+const LINE_RE  = /^(\S+)\s+(Information|Warning|Error|Critical|Verbose):\s*\d+\s*:\s*(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+([\s\S]+)$/;
+const UUID_SRC = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const MSGCODE_RE = /\b([0-9A-F]{8})\b/;
+const MODULE_RE  = /\[([^\]]+)\]\s*([\s\S]*)$/;
+
+let _idSeq = 0;
+
+// ── File classifiers ────────────────────────────────────────────────────────
+function getEntryTab(name) {
+  const n = name.toLowerCase();
+  if (n.includes('gatewayerrors'))  return 'errors';
+  if (n.includes('gatewayinfo'))    return 'info';
+  if (n.includes('gatewaynetwork')) return 'network';
+  if (/^mashup\d/i.test(n) || n.includes('mashup20')) return 'mashup';
+  if (n.includes('on-premises_data_gateway') ||
+      n.includes('gatewayconfigurator') ||
+      n.includes('integrationruntime')) return 'installer';
+  return null;
+}
+function isQueryExecCsv(name)  { return /queryexecutionreport/i.test(name); }
+function isQueryStartCsv(name) { return /querystartreport/i.test(name); }
+function isPerfReport(name) {
+  return /SystemCounterAggregationReport|ConcurrentOperationAggregationReport|QueryExecutionAggregationReport|MashupEvaluationReport|OpenConnectionReport/i.test(name);
+}
+function isRawFile(name) {
+  const n = name.toLowerCase();
+  return n.endsWith('.config') || n.endsWith('.txt') ||
+         n.includes('gatewayports') ||
+         n.includes('mashupcontainerprofiles') ||
+         n.includes('dbproviderfactory') ||
+         n.includes('exportedfilenames') ||
+         n.includes('querystreaming');
+}
+
+// ── CSV / data source helpers ───────────────────────────────────────────────
+function parseCsvRow(line) {
+  const res = []; let inQ = false, cur = '';
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { if (inQ && line[i+1] === '"') { cur += '"'; i++; } else inQ = !inQ; }
+    else if (c === ',' && !inQ) { res.push(cur); cur = ''; }
+    else cur += c;
+  }
+  res.push(cur);
+  return res;
+}
+function extractDataSourceUrl(ds) {
+  if (!ds) return '—';
+  try {
+    const arr = JSON.parse(ds);
+    if (Array.isArray(arr) && arr.length > 0) {
+      const obj = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0];
+      if (obj.FullPath) return obj.FullPath;
+      if (obj.Server)   return obj.Database ? `${obj.Server}/${obj.Database}` : obj.Server;
+      if (obj.path)     return obj.path;
+      if (obj.ConnectorType) return obj.ConnectorType;
+      if (obj.kind)     return obj.kind;
+      return ds;
+    }
+  } catch {}
+  const m = ds.match(/https?:\/\/[^\s"\\,\]]+/);
+  return m ? m[0] : ds.substring(0, 100);
+}
+function extractConnectorType(ds) {
+  if (!ds) return null;
+  try {
+    const arr = JSON.parse(ds);
+    if (Array.isArray(arr) && arr.length > 0) {
+      const obj = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0];
+      return obj.ConnectorType || obj.kind || null;
+    }
+  } catch {}
+  return null;
+}
+
+// ── Append helpers ──────────────────────────────────────────────────────────
+function appendAll(target, src) {
+  if (src.length < 10000) { target.push(...src); return; }
+  for (let i = 0; i < src.length; i++) target.push(src[i]);
+}
+function appendWithCap(target, src, cap, dropKey, stats) {
+  if (cap <= 0) { appendAll(target, src); return; }
+  const room = cap - target.length;
+  if (room <= 0) { if (stats && dropKey) stats[dropKey] += src.length; return; }
+  if (src.length <= room) { appendAll(target, src); return; }
+  appendAll(target, src.slice(0, room));
+  if (stats && dropKey) stats[dropKey] += (src.length - room);
+}
+function maxOf(arr) {
+  let m = -Infinity;
+  for (let i = 0; i < arr.length; i++) { const v = arr[i]; if (v > m) m = v; }
+  return m === -Infinity ? null : m;
+}
+
+// ── Parsers (pure: no state mutation) ───────────────────────────────────────
+function parseQueryExecCsv(text) {
+  const rows = [];
+  const lineRe = /[^\r\n]+/g;
+  let m = lineRe.exec(text);
+  if (!m) return rows;
+  const headers = parseCsvRow(m[0]).map(h => h.trim());
+  const idx = {};
+  for (let i = 0; i < headers.length; i++) idx[headers[i]] = i;
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
+    if (!line.trim()) continue;
+    const vals = parseCsvRow(line);
+    const endTime = (vals[idx['QueryExecutionEndTimeUTC']] || '').trim();
+    rows.push({
+      _ts: endTime ? new Date(endTime) : null,
+      _endTime: endTime,
+      _dur:       parseInt(vals[idx['QueryExecutionDuration(ms)']]    || '0', 10) || 0,
+      _ok:        ((vals[idx['Success']] || '').trim().toUpperCase() === 'Y'),
+      _src:       extractDataSourceUrl((vals[idx['DataSource']] || '').trim()),
+      _err:       (vals[idx['ErrorMessage']] || '').trim(),
+      _type:      (vals[idx['QueryType']] || '').trim(),
+      _trackingId:(vals[idx['QueryTrackingId']] || '').trim(),
+      _requestId: (vals[idx['RequestId']] || '').trim(),
+      _dataRead:  parseInt(vals[idx['DataReadingDuration(ms)']]       || '0', 10) || 0,
+      _serialize: parseInt(vals[idx['DataSerializationDuration(ms)']] || '0', 10) || 0,
+    });
+  }
+  return rows;
+}
+
+function parseQueryStartCsv(text) {
+  const rows = [];
+  const lineRe = /[^\r\n]+/g;
+  if (!lineRe.exec(text)) return rows;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
+    if (!line || line.length < 50) continue;
+    const vals = parseCsvRow(line);
+    if (vals.length < 8) continue;
+    const ds  = vals[2] || '';
+    const ctx = vals[7] || '';
+    const row = {
+      _ts:            vals[4] ? new Date(vals[4]) : null,
+      _trackingId:    vals[3] || '',
+      _requestId:     vals[1] || '',
+      _type:          vals[5] || '',
+      _src:           extractDataSourceUrl(ds),
+      _connectorType: extractConnectorType(ds),
+      _client: null, _service: null, _envId: null, _connId: null,
+      _workflowId: null, _runId: null,
+      _rootActivityId: null, _currentActivityId: null,
+    };
+    if (ctx && ctx[0] === '{') {
+      try {
+        const parsed = JSON.parse(ctx);
+        const stc = parsed && parsed.serviceTraceContexts;
+        if (Array.isArray(stc) && stc.length > 0) {
+          row._service = stc[0].serviceName || null;
+          const tids = stc[0].traceIds;
+          if (Array.isArray(tids)) {
+            for (let i = 0; i < tids.length; i++) {
+              const t = tids[i];
+              const v = t && t.value != null ? String(t.value) : null;
+              switch (t && t.key) {
+                case 'Client':            row._client            = v; break;
+                case 'EnvironmentId':     row._envId             = v; break;
+                case 'ConnectionId':      row._connId            = v; break;
+                case 'WorkflowId':        row._workflowId        = v; break;
+                case 'RunId':             row._runId             = v; break;
+                case 'RootActivityId':    row._rootActivityId    = v; break;
+                case 'CurrentActivityId': row._currentActivityId = v; break;
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function parsePerfReport(name, text, perf, stats) {
+  const n = name.toLowerCase();
+  const lineRe = /[^\r\n]+/g;
+  let m = lineRe.exec(text);
+  if (!m) return;
+  const headers = parseCsvRow(m[0]).map(h => h.trim());
+  const idx = {};
+  for (let i = 0; i < headers.length; i++) idx[headers[i]] = i;
+  const out = [];
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
+    if (!line.trim()) continue;
+    const vals = parseCsvRow(line);
+    if (n.includes('systemcounter')) {
+      out.push({
+        CounterName: (vals[idx['CounterName']] || '').trim(),
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Average: (vals[idx['Average']] || '').trim(),
+        Max: (vals[idx['Max']] || '').trim(),
+        Min: (vals[idx['Min']] || '').trim(),
+      });
+    } else if (n.includes('concurrentoperation')) {
+      out.push({
+        CounterName: (vals[idx['CounterName']] || '').trim(),
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Max: (vals[idx['Max']] || '').trim(),
+      });
+    } else if (n.includes('queryexecutionaggregation')) {
+      out.push({
+        AggregationStartTimeUTC: (vals[idx['AggregationStartTimeUTC']] || '').trim(),
+        Success: (vals[idx['Success']] || '').trim(),
+        Count: (vals[idx['Count']] || '').trim(),
+        'AverageQueryExecutionDuration(ms)': (vals[idx['AverageQueryExecutionDuration(ms)']] || '').trim(),
+        'MaxQueryExecutionDuration(ms)': (vals[idx['MaxQueryExecutionDuration(ms)']] || '').trim(),
+      });
+    } else if (n.includes('mashupevaluation')) {
+      out.push({
+        RequestId: (vals[idx['RequestId']] || '').trim(),
+        DataSource: (vals[idx['DataSource']] || '').trim(),
+        'TotalProcessorTime(ms)': (vals[idx['TotalProcessorTime(ms)']] || '').trim(),
+        MaxWorkingSet: (vals[idx['MaxWorkingSet']] || '').trim(),
+        MaxPercentProcessorTime: (vals[idx['MaxPercentProcessorTime']] || '').trim(),
+      });
+    } else if (n.includes('openconnection')) {
+      out.push({
+        OpenConnectionStartTimeUTC: (vals[idx['OpenConnectionStartTimeUTC']] || '').trim(),
+        RequestId: (vals[idx['RequestId']] || '').trim(),
+        DataSource: (vals[idx['DataSource']] || '').trim(),
+        'OpenConnectionDuration(ms)': (vals[idx['OpenConnectionDuration(ms)']] || '').trim(),
+        Success: (vals[idx['Success']] || '').trim(),
+        ErrorMessage: (vals[idx['ErrorMessage']] || '').trim(),
+      });
+    }
+  }
+  if (n.includes('systemcounter'))                  appendWithCap(perf.counters,   out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf', stats);
+  else if (n.includes('concurrentoperation'))       appendWithCap(perf.concurrent, out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf', stats);
+  else if (n.includes('queryexecutionaggregation')) appendWithCap(perf.queryAgg,   out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf', stats);
+  else if (n.includes('mashupevaluation'))          appendWithCap(perf.mashupEval, out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf', stats);
+  else if (n.includes('openconnection'))            appendWithCap(perf.openConn,   out, MAX_PERF_ROWS_PER_TYPE, 'droppedPerf', stats);
+}
+
+function parseLine(line, filename, tab) {
+  const m = line.match(LINE_RE);
+  if (!m) return null;
+  const [, source, level, tsStr, rest] = m;
+  const timestamp = new Date(tsStr);
+  if (isNaN(timestamp)) return null;
+  const corrMatches = [...rest.matchAll(new RegExp(UUID_SRC, 'gi'))];
+  const correlationIds = [...new Set(corrMatches.map(x => x[0].toLowerCase()))];
+  const modMatch = rest.match(MODULE_RE);
+  const module = modMatch ? modMatch[1] : '';
+  let message = modMatch ? modMatch[2].trim() : rest.trim();
+  if (message.length > MAX_ENTRY_MESSAGE_CHARS) {
+    message = message.substring(0, MAX_ENTRY_MESSAGE_CHARS) + '\n… (message truncated)';
+  }
+  const codeMatch = rest.match(MSGCODE_RE);
+  const messageCode = codeMatch ? codeMatch[1] : '';
+  return { id: _idSeq++, source, level, timestamp, correlationIds, module, messageCode, message, file: filename, tab };
+}
+
+function parseLogFileMultiLine(text, filename, tab, onEntry) {
+  let current = null;
+  const lineRe = /[^\r\n]+/g;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const line = m[0];
+    if (!line.trim()) continue;
+    const parsed = parseLine(line, filename, tab);
+    if (parsed) {
+      if (current) onEntry(current);
+      current = parsed;
+    } else if (current) {
+      if (current.message.length < MAX_ENTRY_MESSAGE_CHARS) {
+        const rem = MAX_ENTRY_MESSAGE_CHARS - current.message.length;
+        current.message += '\n' + line.substring(0, Math.max(0, rem));
+        if (current.message.length >= MAX_ENTRY_MESSAGE_CHARS) {
+          current.message += '\n… (message truncated)';
+        }
+      }
+    }
+  }
+  if (current) onEntry(current);
+}
+
+function cacheRawFile(name, text, rawFiles) {
+  const lower = name.toLowerCase();
+  if (lower.includes('gatewayports')) {
+    rawFiles[name] = text.length > PORT_RAW_FILE_MAX_CHARS
+      ? text.substring(0, PORT_RAW_FILE_MAX_CHARS) + '\n\n… (port report truncated in memory to reduce browser usage)'
+      : text;
+    return;
+  }
+  rawFiles[name] = text.length > RAW_FILE_MAX_CHARS
+    ? text.substring(0, RAW_FILE_MAX_CHARS) + '\n\n… (truncated in memory to reduce browser usage)'
+    : text;
+}
+
+function parseGwInfoFromText(filename, text, gwInfo) {
+  const n = filename.toLowerCase();
+  if (!n.includes('gatewaycluster') && !n.includes('gatewayproperties') && !n.includes('gatewayallclusters')) return;
+  const trimmed = text.trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const obj = Array.isArray(parsed) ? (parsed[0] || {}) : parsed;
+      const flatten = (o, prefix) => {
+        for (const [k, v] of Object.entries(o)) {
+          const key = prefix ? `${prefix}.${k}` : k;
+          if (v === null || v === undefined) continue;
+          if (Array.isArray(v)) {
+            if (v.length === 0) continue;
+            if (typeof v[0] !== 'object') gwInfo[key] = v.join(', ');
+            else gwInfo[key] = `${v.length} item${v.length !== 1 ? 's' : ''}`;
+          } else if (typeof v === 'object') {
+            flatten(v, key);
+          } else {
+            gwInfo[key] = String(v);
+          }
+        }
+      };
+      flatten(obj, '');
+      return;
+    } catch {}
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^([^=:\r\n]+?)[=:]\s*(.+)$/);
+    if (m) gwInfo[m[1].trim()] = m[2].trim();
+  }
+}
+
+function buildAttributionIndex(rows) {
+  if (!rows || rows.length === 0) return null;
+  const idx = new Map();
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const a = {
+      client: r._client, workflowId: r._workflowId, runId: r._runId,
+      connId: r._connId, connectorType: r._connectorType, src: r._src,
+      envId: r._envId, rootActivityId: r._rootActivityId,
+      currentActivityId: r._currentActivityId,
+    };
+    if (r._trackingId)        idx.set(r._trackingId.toLowerCase(),        a);
+    if (r._requestId)         idx.set(r._requestId.toLowerCase(),         a);
+    if (r._currentActivityId) idx.set(r._currentActivityId.toLowerCase(), a);
+    if (r._rootActivityId)    idx.set(r._rootActivityId.toLowerCase(),    a);
+  }
+  return idx;
+}
+
+// ── Worker message handler ──────────────────────────────────────────────────
+self.onmessage = async (e) => {
+  const msg = e.data || {};
+  if (msg.type !== 'parse') return;
+  const { buffer, isBasic } = msg;
+  _idSeq = 0;
+
+  const result = {
+    allEntries: [],
+    tabEntries: Object.fromEntries(LOG_TABS.map(t => [t, []])),
+    rawFiles: {},
+    gwInfo: {},
+    modules: new Set(),
+    queryExecRows: [],
+    queryStartRows: [],
+    queryMaxDur: 0,
+    perf: { counters: [], concurrent: [], queryAgg: [], mashupEval: [], openConn: [] },
+    ingestStats: { droppedLogs: 0, droppedQueryExec: 0, droppedQueryStart: 0, droppedPerf: 0, skippedFiles: 0 },
+    attributionIndex: null,
+  };
+
+  try {
+    self.postMessage({ type: 'progress', message: 'Opening zip…' });
+    const zip = await JSZip.loadAsync(buffer);
+    const entries = Object.values(zip.files).filter(f => !f.dir);
+    let done = 0;
+
+    for (const ze of entries) {
+      const name = ze.name.split('/').pop();
+      if (!name) continue;
+      done++;
+      // Throttle progress messages to avoid flooding the main thread.
+      if (done === 1 || done === entries.length || done % 5 === 0) {
+        self.postMessage({ type: 'progress', message: `Parsing ${name} (${done}/${entries.length})…` });
+      }
+
+      let text;
+      try { text = await ze.async('string'); } catch { continue; }
+
+      if (isQueryExecCsv(name)) {
+        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
+        appendWithCap(result.queryExecRows, parseQueryExecCsv(text), MAX_QUERY_EXEC_ROWS, 'droppedQueryExec', result.ingestStats);
+        continue;
+      }
+      if (isQueryStartCsv(name)) {
+        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
+        appendWithCap(result.queryStartRows, parseQueryStartCsv(text), MAX_QUERY_START_ROWS, 'droppedQueryStart', result.ingestStats);
+        continue;
+      }
+      if (isPerfReport(name)) {
+        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
+        parsePerfReport(name, text, result.perf, result.ingestStats);
+        continue;
+      }
+      if (isRawFile(name)) {
+        parseGwInfoFromText(name, text, result.gwInfo);
+        cacheRawFile(name, text, result.rawFiles);
+        continue;
+      }
+      const tab = getEntryTab(name);
+      if (isBasic && !['errors', 'info'].includes(tab)) {
+        result.ingestStats.skippedFiles++;
+        continue;
+      }
+      if (!tab) {
+        cacheRawFile(name, text, result.rawFiles);
+        continue;
+      }
+
+      parseLogFileMultiLine(text, name, tab, (entry) => {
+        if (!isBasic && result.allEntries.length >= MAX_LOG_ENTRIES_TOTAL) {
+          result.ingestStats.droppedLogs++;
+          return;
+        }
+        result.allEntries.push(entry);
+        result.tabEntries[tab].push(entry);
+        if (entry.module) result.modules.add(entry.module);
+      });
+    }
+
+    if (result.queryExecRows.length > 0) {
+      result.queryMaxDur = maxOf(result.queryExecRows.map(r => r._dur)) || 0;
+    }
+    result.attributionIndex = buildAttributionIndex(result.queryStartRows);
+
+    // Convert Set to Array for cheaper structured cloning + reconstruct on main side.
+    const out = {
+      allEntries: result.allEntries,
+      tabEntries: result.tabEntries,
+      rawFiles: result.rawFiles,
+      gwInfo: result.gwInfo,
+      modules: Array.from(result.modules),
+      queryExecRows: result.queryExecRows,
+      queryStartRows: result.queryStartRows,
+      queryMaxDur: result.queryMaxDur,
+      perf: result.perf,
+      ingestStats: result.ingestStats,
+      attributionIndex: result.attributionIndex,
+    };
+    self.postMessage({ type: 'done', result: out });
+  } catch (err) {
+    self.postMessage({ type: 'error', error: (err && err.message) || String(err) });
+  }
+};
+</script>
+
 <script>
 'use strict';
 
@@ -2286,126 +2759,69 @@ bumpVisitOnce();
 initMode();
 
 // ── Load zip ─────────────────────────────────────────────────────────────────
-async function loadZip(file) {
-  setLoading(true, 'Opening zip…');
-  try {
-    if (file.size > HARD_MAX_ZIP_BYTES) {
-      alert(
-        `Zip is too large for in-browser parsing (${fmtN(Math.round(file.size / (1024 * 1024)))} MB).\n\n`
-        + `Limit: ${fmtN(Math.round(HARD_MAX_ZIP_BYTES / (1024 * 1024)))} MB.\n`
-        + 'Please split the archive or upload a smaller subset.'
-      );
-      setLoading(false);
-      return;
-    }
-    let buf = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(buf);
-    // Drop the source ArrayBuffer reference once zip metadata is loaded.
-    buf = null;
-    await processZip(zip);
-    bumpFileCount();
-  } catch (err) {
-    alert('Error loading zip:\n' + err.message);
-    setLoading(false);
-  }
+// Lazy-instantiate the parsing worker from the inline <script type="text/x-worker-source">
+// bundle so all zip + log parsing runs off the main thread.
+let _parseWorker = null;
+function getParseWorker() {
+  if (_parseWorker) return _parseWorker;
+  const src = document.getElementById('worker-bundle').textContent;
+  const blob = new Blob([src], { type: 'application/javascript' });
+  _parseWorker = new Worker(URL.createObjectURL(blob));
+  return _parseWorker;
 }
 
-async function processZip(zip) {
-  _idSeq = 0;
-  state.ingestStats = { droppedLogs: 0, droppedQueryExec: 0, droppedQueryStart: 0, droppedPerf: 0, skippedFiles: 0 };
-  state.allEntries  = [];
-  state.tabEntries  = Object.fromEntries(LOG_TABS.map(t => [t, []]));
-  state.tabFiltered = Object.fromEntries(LOG_TABS.map(t => [t, []]));
-  state.rawFiles    = {};
-  state.gwInfo      = {};
-  state.modules.clear();
-  state.queryExecRows    = [];
-  state.queryExecFiltered = [];
-  state.queryMaxDur      = 0;
-  state.queryStartRows   = [];
-  state.attributionIndex = null;
-  state.queryCsvScroller = null;
-  state.perf = { counters: [], concurrent: [], queryAgg: [], mashupEval: [], openConn: [] };
-
-  const entries = Object.values(zip.files).filter(f => !f.dir);
-  let done = 0;
-
-  for (const ze of entries) {
-    const name = ze.name.split('/').pop();
-    if (!name) continue;
-    setLoading(true, `Parsing ${name} (${++done}/${entries.length})…`);
-
-  
-
-    let text;
-    try { text = await ze.async('string'); } catch { continue; }
-
-    if (isQueryExecCsv(name)) {
-      if (isBasicMode()) {
-        state.ingestStats.skippedFiles++;
-        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-        continue;
-      }
-      appendWithCap(state.queryExecRows, parseQueryExecCsv(text), MAX_QUERY_EXEC_ROWS, 'droppedQueryExec');
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-    if (isQueryStartCsv(name)) {
-      if (isBasicMode()) {
-        state.ingestStats.skippedFiles++;
-        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-        continue;
-      }
-      appendWithCap(state.queryStartRows, parseQueryStartCsv(text), MAX_QUERY_START_ROWS, 'droppedQueryStart');
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-    if (isPerfReport(name)) {
-      if (isBasicMode()) {
-        state.ingestStats.skippedFiles++;
-        if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-        continue;
-      }
-      parsePerfReport(name, text);
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-    if (isRawFile(name)) {
-      parseGwInfoFromText(name, text);
-      cacheRawFile(name, text);
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-    const tab = getEntryTab(name);
-    if (isBasicMode() && !['errors', 'info'].includes(tab)) {
-      state.ingestStats.skippedFiles++;
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-    if (!tab) {
-      cacheRawFile(name, text);
-      text = '';
-      if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
-      continue;
-    }
-
-    parseLogFileMultiLine(text, name, tab, (e) => {
-      if (!isBasicMode() && state.allEntries.length >= MAX_LOG_ENTRIES_TOTAL) {
-        state.ingestStats.droppedLogs++;
-        return;
-      }
-      state.allEntries.push(e);
-      state.tabEntries[tab].push(e);
-      if (e.module) state.modules.add(e.module);
-    });
-    text = '';
-    if (done % 10 === 0) await new Promise(r => setTimeout(r, 0));
+async function loadZip(file) {
+  setLoading(true, 'Opening zip…');
+  if (file.size > HARD_MAX_ZIP_BYTES) {
+    alert(
+      `Zip is too large for in-browser parsing (${fmtN(Math.round(file.size / (1024 * 1024)))} MB).\n\n`
+      + `Limit: ${fmtN(Math.round(HARD_MAX_ZIP_BYTES / (1024 * 1024)))} MB.\n`
+      + 'Please split the archive or upload a smaller subset.'
+    );
+    setLoading(false);
+    return;
   }
+  let buf;
+  try { buf = await file.arrayBuffer(); }
+  catch (err) { alert('Error reading file:\n' + err.message); setLoading(false); return; }
 
-  if (state.queryExecRows.length > 0)
-    state.queryMaxDur = maxOf(state.queryExecRows.map(r => r._dur)) || 0;
+  const worker = getParseWorker();
+  await new Promise((resolve) => {
+    worker.onmessage = (e) => {
+      const m = e.data || {};
+      if (m.type === 'progress') {
+        setLoading(true, m.message);
+      } else if (m.type === 'error') {
+        alert('Error loading zip:\n' + m.error);
+        setLoading(false);
+        resolve();
+      } else if (m.type === 'done') {
+        try { applyParseResult(m.result); bumpFileCount(); }
+        catch (err) { alert('Error applying parse result:\n' + err.message); setLoading(false); }
+        resolve();
+      }
+    };
+    // Transfer the ArrayBuffer to avoid copying — the main thread no longer needs it.
+    worker.postMessage({ type: 'parse', buffer: buf, isBasic: isBasicMode() }, [buf]);
+  });
+}
 
-  state.attributionIndex = buildAttributionIndex(state.queryStartRows);
+// Populate state from a worker parse result and finalise the UI.
+function applyParseResult(r) {
+  state.ingestStats     = r.ingestStats;
+  state.allEntries      = r.allEntries;
+  state.tabEntries      = r.tabEntries;
+  state.tabFiltered     = Object.fromEntries(LOG_TABS.map(t => [t, r.tabEntries[t] || []]));
+  state.rawFiles        = r.rawFiles;
+  state.gwInfo          = r.gwInfo;
+  state.modules         = new Set(r.modules);
+  state.queryExecRows   = r.queryExecRows;
+  state.queryExecFiltered = r.queryExecRows;
+  state.queryMaxDur     = r.queryMaxDur || 0;
+  state.queryStartRows  = r.queryStartRows;
+  state.attributionIndex = r.attributionIndex; // Map survives structured clone
+  state.queryCsvScroller = null;
+  state.perf            = r.perf;
 
   // Synthesize Network-tab log entries from each GatewayPorts*.log file so the
   // port-test runs are visible chronologically alongside real network events.
@@ -2443,6 +2859,8 @@ async function processZip(zip) {
     );
   }
 }
+
+// Legacy main-thread parser removed — see `loadZip` + worker-bundle script.
 
 function injectPortTestsIntoNetwork() {
   const portFiles = Object.entries(state.rawFiles)
