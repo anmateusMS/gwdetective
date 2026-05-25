@@ -1102,6 +1102,19 @@ body {
       Open Zip File
     </button>
     <input type="file" id="file-input" accept=".zip" style="display:none">
+
+    <!-- Recent-session panel: shown only when an IndexedDB cache entry exists. -->
+    <div id="recent-session" style="display:none; margin-top:18px; padding:10px 14px; background:rgba(255,255,255,0.05); border:1px solid var(--cp-border); border-radius:6px; font-size:13px; color:var(--cp-text-muted); display:flex; flex-direction:column; gap:8px; align-items:center;">
+      <div>
+        Last opened: <strong id="recent-name" style="color:var(--cp-text);"></strong>
+        <span id="recent-meta" style="opacity:0.7;"></span>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <button class="btn btn-sm" onclick="reopenCachedSession()" title="Restore the previously parsed file from local cache">↻ Reopen</button>
+        <button class="btn btn-sm" onclick="clearCachedSession(true)" title="Delete the cached parse result from this browser">🗑 Clear cache</button>
+      </div>
+    </div>
+
     <div style="margin-top:32px; display:flex; align-items:center; gap:12px; justify-content:center;">
       <span style="font-size:13px; color:var(--cp-text-muted);">Basic</span>
       <div style="position:relative; width:42px; height:16px; background:#ffffff; border-radius:8px; cursor:pointer; transition:background 0.3s;" id="mode-switch" onclick="toggleMode()">
@@ -2785,6 +2798,91 @@ function bumpFileCount() {
 bumpVisitOnce();
 initMode();
 
+// ── IndexedDB session cache ──────────────────────────────────────────────────
+// Single-slot cache: only ever stores the most recently parsed file.
+// Loading a new zip overwrites the previous entry, so "load another" implicitly
+// clears the previous cache. Users can also clear explicitly.
+const IDB_NAME  = 'gwTracerCache';
+const IDB_STORE = 'lastSession';
+const IDB_KEY   = 'current';
+let _idbConn = null;
+function _openIdb() {
+  if (_idbConn) return Promise.resolve(_idbConn);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => { _idbConn = req.result; resolve(_idbConn); };
+    req.onerror   = () => reject(req.error);
+  });
+}
+function _idbReq(mode, fn) {
+  return _openIdb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, mode);
+    const store = tx.objectStore(IDB_STORE);
+    let outcome;
+    const r = fn(store);
+    if (r) r.onsuccess = () => { outcome = r.result; };
+    tx.oncomplete = () => resolve(outcome);
+    tx.onerror    = () => reject(tx.error);
+  }));
+}
+async function saveCachedSession(meta, result) {
+  try {
+    await _idbReq('readwrite', s => s.put({ meta, result, savedAt: Date.now() }, IDB_KEY));
+  } catch (e) {
+    console.warn('Could not cache parse result:', e);
+  }
+}
+async function loadCachedSession() {
+  try { return await _idbReq('readonly', s => s.get(IDB_KEY)); }
+  catch (e) { console.warn('Could not read cache:', e); return undefined; }
+}
+async function clearCachedSession(updateUi) {
+  try { await _idbReq('readwrite', s => s.delete(IDB_KEY)); }
+  catch (e) { console.warn('Could not clear cache:', e); }
+  if (updateUi) {
+    const panel = document.getElementById('recent-session');
+    if (panel) panel.style.display = 'none';
+  }
+}
+function _fmtBytes(n) {
+  if (!n && n !== 0) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+async function refreshRecentSessionPanel() {
+  const panel = document.getElementById('recent-session');
+  if (!panel) return;
+  const entry = await loadCachedSession();
+  if (!entry || !entry.meta) { panel.style.display = 'none'; return; }
+  document.getElementById('recent-name').textContent = entry.meta.fileName || '(unknown)';
+  const ago = entry.savedAt ? new Date(entry.savedAt).toLocaleString() : '';
+  const sz  = _fmtBytes(entry.meta.fileSize);
+  document.getElementById('recent-meta').textContent =
+    [sz, ago && '· ' + ago, entry.meta.isBasic ? '· Basic' : '· Full'].filter(Boolean).join(' ');
+  panel.style.display = 'flex';
+}
+async function reopenCachedSession() {
+  const entry = await loadCachedSession();
+  if (!entry || !entry.result) {
+    alert('No cached session found.');
+    refreshRecentSessionPanel();
+    return;
+  }
+  setLoading(true, 'Restoring cached session…');
+  try {
+    // Restore the saved mode flag so the UI reflects how the data was parsed.
+    if (typeof entry.meta.isBasic === 'boolean') setMode(entry.meta.isBasic);
+    applyParseResult(entry.result);
+  } catch (err) {
+    alert('Could not restore cached session:\n' + err.message);
+    setLoading(false);
+  }
+}
+// Surface the panel on initial load.
+refreshRecentSessionPanel();
+
 // ── Load zip ─────────────────────────────────────────────────────────────────
 // Lazy-instantiate the parsing worker from the inline <script type="text/x-worker-source">
 // bundle so all zip + log parsing runs off the main thread.
@@ -2823,7 +2921,16 @@ async function loadZip(file) {
         setLoading(false);
         resolve();
       } else if (m.type === 'done') {
-        try { applyParseResult(m.result); bumpFileCount(); }
+        try {
+          applyParseResult(m.result);
+          bumpFileCount();
+          // Overwrite any previous cache — single-slot, so loading a new file
+          // effectively clears the previous one.
+          saveCachedSession(
+            { fileName: file.name, fileSize: file.size, isBasic: isBasicMode() },
+            m.result
+          );
+        }
         catch (err) { alert('Error applying parse result:\n' + err.message); setLoading(false); }
         resolve();
       }
@@ -4936,6 +5043,8 @@ function resetApp() {
   const qlw = document.getElementById('query-log-wrap');
   if (qrw) qrw.style.display = 'none';
   if (qlw) qlw.style.display = 'none';
+  // Re-show the cache panel if a session is stored.
+  refreshRecentSessionPanel();
 }
 function _resetQueryState() {}
 
