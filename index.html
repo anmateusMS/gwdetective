@@ -7,10 +7,12 @@
 <!--
   To make this file fully offline, run this PowerShell snippet once:
     $html = Get-Content .\index.html -Raw
-    $jszip = Invoke-WebRequest https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js | Select-Object -Exp Content
+    $fflate = Invoke-WebRequest https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.min.js | Select-Object -Exp Content
     $chartjs = Invoke-WebRequest https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js | Select-Object -Exp Content
     $chartAdapter = Invoke-WebRequest https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js | Select-Object -Exp Content
-    $html = $html -replace '<script src="https://cdnjs[^"]+"></script>', "<script>$jszip</script>"
+    # fflate is loaded inside the worker bundle via importScripts; inline by
+    # injecting it as the first line of the <script id="worker-bundle"> body.
+    $html = $html -replace "importScripts\('https://cdn.jsdelivr.net/npm/fflate[^']+'\);", $fflate
     $html = $html -replace '<script src="https://cdn.jsdelivr.net/npm/chart.js@[^"]+"></script>', "<script>$chartjs</script>"
     $html = $html -replace '<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter[^"]+"></script>', "<script>$chartAdapter</script>"
     $html | Set-Content .\index.html -Encoding UTF8
@@ -1467,7 +1469,7 @@ body {
   </div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin="anonymous"></script>
+<!-- fflate is now loaded inside the parser Worker (see worker-bundle below). -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js" crossorigin="anonymous"></script>
 
@@ -1478,7 +1480,11 @@ body {
 -->
 <script id="worker-bundle" type="text/x-worker-source">
 'use strict';
-importScripts('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+// fflate is a smaller (~28 KB) + faster zip library than JSZip. We use its
+// `unzip` async API plus a `filter` callback that drops files we don't need
+// *before* decompression — a big memory/CPU win in Basic mode.
+importScripts('https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.min.js');
+const _td = new TextDecoder('utf-8', { fatal: false });
 
 // ── Constants (kept in sync with main script) ───────────────────────────────
 const MAX_LOG_ENTRIES_TOTAL   = 180000;
@@ -1860,34 +1866,59 @@ self.onmessage = async (e) => {
 
   try {
     self.postMessage({ type: 'progress', message: 'Opening zip…' });
-    const zip = await JSZip.loadAsync(buffer);
-    const entries = Object.values(zip.files).filter(f => !f.dir);
+
+    // Decide up-front which entries are worth decompressing. In Basic mode
+    // we drop the heavy CSV/perf files and any log not destined for the
+    // Errors/Info tabs — fflate's filter runs before inflation so these
+    // bytes never enter memory as a Uint8Array.
+    const wantEntry = (name) => {
+      const base = name.split('/').pop();
+      if (!base) return false;
+      if (isQueryExecCsv(base) || isQueryStartCsv(base) || isPerfReport(base)) {
+        if (isBasic) { result.ingestStats.skippedFiles++; return false; }
+        return true;
+      }
+      if (isRawFile(base)) return true;
+      const tab = getEntryTab(base);
+      if (isBasic && !['errors', 'info'].includes(tab)) {
+        result.ingestStats.skippedFiles++;
+        return false;
+      }
+      return true;
+    };
+
+    const files = await new Promise((resolve, reject) => {
+      self.fflate.unzip(new Uint8Array(buffer), {
+        filter: (file) => !file.name.endsWith('/') && wantEntry(file.name),
+      }, (err, unzipped) => err ? reject(err) : resolve(unzipped));
+    });
+
+    const names = Object.keys(files);
+    const total = names.length;
     let done = 0;
 
-    for (const ze of entries) {
-      const name = ze.name.split('/').pop();
+    for (const fullName of names) {
+      const name = fullName.split('/').pop();
       if (!name) continue;
       done++;
-      // Throttle progress messages to avoid flooding the main thread.
-      if (done === 1 || done === entries.length || done % 5 === 0) {
-        self.postMessage({ type: 'progress', message: `Parsing ${name} (${done}/${entries.length})…` });
+      if (done === 1 || done === total || done % 5 === 0) {
+        self.postMessage({ type: 'progress', message: `Parsing ${name} (${done}/${total})…` });
       }
 
       let text;
-      try { text = await ze.async('string'); } catch { continue; }
+      try { text = _td.decode(files[fullName]); } catch { continue; }
+      // Release the decompressed bytes back to the allocator as we go.
+      files[fullName] = null;
 
       if (isQueryExecCsv(name)) {
-        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
         appendWithCap(result.queryExecRows, parseQueryExecCsv(text), MAX_QUERY_EXEC_ROWS, 'droppedQueryExec', result.ingestStats);
         continue;
       }
       if (isQueryStartCsv(name)) {
-        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
         appendWithCap(result.queryStartRows, parseQueryStartCsv(text), MAX_QUERY_START_ROWS, 'droppedQueryStart', result.ingestStats);
         continue;
       }
       if (isPerfReport(name)) {
-        if (isBasic) { result.ingestStats.skippedFiles++; continue; }
         parsePerfReport(name, text, result.perf, result.ingestStats);
         continue;
       }
@@ -1897,10 +1928,6 @@ self.onmessage = async (e) => {
         continue;
       }
       const tab = getEntryTab(name);
-      if (isBasic && !['errors', 'info'].includes(tab)) {
-        result.ingestStats.skippedFiles++;
-        continue;
-      }
       if (!tab) {
         cacheRawFile(name, text, result.rawFiles);
         continue;
