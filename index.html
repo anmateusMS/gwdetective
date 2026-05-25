@@ -341,6 +341,7 @@ body {
   padding: 3px 8px; border: 1px solid var(--cp-border); border-radius: 0.625rem;
   background: var(--cp-surface); color: var(--cp-text);
   font-size: 11px; font-family: inherit;
+  min-width: 190px;
 }
 .global-date-bar input:focus { outline: none; border-color: var(--cp-accent); }
 .global-date-bar.active {
@@ -1197,10 +1198,10 @@ body {
   <!-- Global date filter (applies to every tab) -->
   <div class="global-date-bar" id="global-date-bar" style="display:none">
     <span class="gd-icon">📅</span>
-    <span class="filter-label">Date range (all tabs)</span>
-    <input type="datetime-local" id="gd-from" oninput="applyGlobalDateFilter()" title="From (UTC)">
+    <span class="filter-label">Date/time range (all tabs)</span>
+    <input type="datetime-local" id="gd-from" step="1" oninput="applyGlobalDateFilter()" title="From (local date and time)">
     <span class="filter-label">→</span>
-    <input type="datetime-local" id="gd-to" oninput="applyGlobalDateFilter()" title="To (UTC)">
+    <input type="datetime-local" id="gd-to" step="1" oninput="applyGlobalDateFilter()" title="To (local date and time)">
     <button class="btn btn-sm" onclick="clearGlobalDateFilter()">✕ Reset</button>
     <span class="global-date-hint" id="gd-hint"></span>
   </div>
@@ -4015,11 +4016,11 @@ function switchTab(tab) {
 
 // ── Global date filter (applies to every tab) ────────────────────────────────
 // Formats a Date to the local-timezone string that <input type="datetime-local">
-// expects: "YYYY-MM-DDTHH:MM". Returns '' for null/invalid dates.
+// expects: "YYYY-MM-DDTHH:MM:SS". Returns '' for null/invalid dates.
 function toDatetimeLocalValue(d) {
   if (!d || isNaN(d)) return '';
   const pad = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 // Initialise the date filter inputs on first build: discover the dataset's full
